@@ -162,12 +162,12 @@ struct RuleMerger {
 
     if (primary_rule && !r->cmds.empty() &&
         !IsSuffixRule(output) && !r->is_double_colon) {
-      WARN_LOC(r->cmd_loc(),
-               "warning: overriding commands for target `%s'",
-               output.c_str());
-      WARN_LOC(primary_rule->cmd_loc(),
-               "warning: ignoring old commands for target `%s'",
-               output.c_str());
+//      WARN_LOC(r->cmd_loc(),
+//               "warning: overriding commands for target `%s'",
+//               output.c_str());
+//      WARN_LOC(primary_rule->cmd_loc(),
+//               "warning: ignoring old commands for target `%s'",
+//               output.c_str());
       primary_rule = r;
     }
     if (!primary_rule && !r->cmds.empty()) {
