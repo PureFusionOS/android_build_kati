@@ -227,6 +227,9 @@ class DirentDirNode : public DirentNode {
                        string* out) const override {
     ScopedReadDirTracker srdt(this, *path, cur_read_dirs);
     if (!srdt.ok()) {
+      fprintf(stderr, "FindEmulator: find: File system loop detected; `%s' is "
+              "part of the same file system loop as `%s'.\n",
+              path->c_str(), srdt.conflicted().c_str());
       return true;
     }
 
@@ -259,10 +262,11 @@ class DirentDirNode : public DirentNode {
         if (!c->RunFind(fc, d + 1, path, cur_read_dirs, out))
           return false;
         path->resize(orig_path_size);
-        // Found a leaf, stop the search.
-        if (orig_out_size != out->size())
-          return true;
       }
+
+      // Found a leaf, stop the search.
+      if (orig_out_size != out->size())
+        return true;
 
       for (const auto& p : children_) {
         DirentNode* c = p.second;
@@ -318,6 +322,10 @@ class DirentSymlinkNode : public DirentNode {
     unsigned char type = DT_LNK;
     if (fc.follows_symlinks && errno_ != ENOENT) {
       if (errno_) {
+        if (fc.type != FindCommandType::FINDLEAVES) {
+          fprintf(stderr, "FindEmulator: find: `%s': %s\n",
+                  path->c_str(), strerror(errno_));
+        }
         return true;
       }
 
@@ -577,7 +585,7 @@ class FindCommandParser {
       } else if (tok.find_first_of("|;&><*'\"") != string::npos) {
         return false;
       } else {
-        fc_->finddirs.push_back(tok);
+        fc_->finddirs.push_back(tok.as_string());
       }
     }
   }
@@ -586,14 +594,30 @@ class FindCommandParser {
     fc_->type = FindCommandType::FINDLEAVES;
     fc_->follows_symlinks = true;
     StringPiece tok;
+    vector<string> findfiles;
     while (true) {
       if (!GetNextToken(&tok))
         return false;
       if (tok.empty()) {
-        if (fc_->finddirs.size() < 2)
-          return false;
-        fc_->print_cond.reset(new NameCond(fc_->finddirs.back().as_string()));
-        fc_->finddirs.pop_back();
+        if (fc_->finddirs.size() == 0) {
+          // backwards compatibility
+          if (findfiles.size() < 2)
+            return false;
+          fc_->finddirs.swap(findfiles);
+          fc_->print_cond.reset(new NameCond(fc_->finddirs.back()));
+          fc_->finddirs.pop_back();
+        } else {
+          if (findfiles.size() < 1)
+            return false;
+          for (auto& file : findfiles) {
+            FindCond* cond = new NameCond(file);
+            if (fc_->print_cond.get()) {
+              cond = new OrCond(fc_->print_cond.release(), cond);
+            }
+            CHECK(!fc_->print_cond.get());
+            fc_->print_cond.reset(cond);
+          }
+        }
         return true;
       }
 
@@ -614,11 +638,14 @@ class FindCommandParser {
           return false;
         }
         fc_->mindepth = d;
+      } else if (HasPrefix(tok, "--dir=")) {
+        StringPiece dir= tok.substr(strlen("--dir="));
+        fc_->finddirs.push_back(dir.as_string());
       } else if (HasPrefix(tok, "--")) {
         WARN("Unknown flag in findleaves.py: %.*s", SPF(tok));
         return false;
       } else {
-        fc_->finddirs.push_back(tok);
+        findfiles.push_back(tok.as_string());
       }
     }
   }
@@ -749,12 +776,19 @@ class FindEmulatorImpl : public FindEmulator {
       }
       bool should_fallback = false;
       if (!FindDir(fc.chdir, &should_fallback)) {
-        return !should_fallback;
+        if (should_fallback)
+          return false;
+        if (!fc.redirect_to_devnull) {
+          fprintf(stderr,
+                  "FindEmulator: cd: %.*s: No such file or directory\n",
+                  SPF(fc.chdir));
+        }
+        return true;
       }
     }
 
     const size_t orig_out_size = out->size();
-    for (StringPiece finddir : fc.finddirs) {
+    for (const string& finddir : fc.finddirs) {
       const string dir = ConcatDir(fc.chdir, finddir);
 
       if (!CanHandle(dir)) {
@@ -771,10 +805,15 @@ class FindEmulatorImpl : public FindEmulator {
           out->resize(orig_out_size);
           return false;
         }
+        if (!fc.redirect_to_devnull) {
+          fprintf(stderr,
+                  "FindEmulator: find: `%s': No such file or directory\n",
+                  ConcatDir(fc.chdir, finddir).c_str());
+        }
         continue;
       }
 
-      string path = finddir.as_string();
+      string path = finddir;
       unordered_map<const DirentNode*, string> cur_read_dirs;
       if (!base->RunFind(fc, 0, &path, &cur_read_dirs, out)) {
         LOG("FindEmulator: RunFind failed: %s", cmd.c_str());
