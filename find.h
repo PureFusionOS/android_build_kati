@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "loc.h"
 #include "string_piece.h"
 
 using namespace std;
@@ -49,6 +50,7 @@ struct FindCommand {
   int mindepth;
   bool redirect_to_devnull;
 
+  unique_ptr<vector<string>> found_files;
   unique_ptr<unordered_set<string>> read_dirs;
 
  private:
@@ -61,7 +63,7 @@ class FindEmulator {
   virtual ~FindEmulator() = default;
 
   virtual bool HandleFind(const string& cmd, const FindCommand& fc,
-                          string* out) = 0;
+                          const Loc& loc, string* out) = 0;
 
   static FindEmulator* Get();
 

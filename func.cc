@@ -17,9 +17,11 @@
 #include "func.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -464,8 +466,8 @@ void EvalFunc(const vector<Value*>& args, Evaluator* ev, string*) {
   string* text = new string;
   args[0]->Eval(ev, text);
   if (ev->avoid_io()) {
-    KATI_WARN("%s:%d: *warning*: $(eval) in a recipe is not recommended: %s",
-              LOCF(ev->loc()), text->c_str());
+    KATI_WARN_LOC(ev->loc(), "*warning*: $(eval) in a recipe is not recommended: %s",
+                  text->c_str());
   }
   vector<Stmt*> stmts;
   Parse(*text, ev->loc(), &stmts);
@@ -491,8 +493,9 @@ static bool HasNoIoInShellScript(const string& cmd) {
   return false;
 }
 
-static void ShellFuncImpl(const string& shell, const string& cmd,
-                          string* s, FindCommand** fc) {
+static void ShellFuncImpl(const string& shell, const string& shellflag,
+                          const string& cmd, const Loc& loc, string* s,
+                          FindCommand** fc) {
   LOG("ShellFunc: %s", cmd.c_str());
 
 #ifdef TEST_FIND_EMULATOR
@@ -503,11 +506,11 @@ static void ShellFuncImpl(const string& shell, const string& cmd,
     *fc = new FindCommand();
     if ((*fc)->Parse(cmd)) {
 #ifdef TEST_FIND_EMULATOR
-      if (FindEmulator::Get()->HandleFind(cmd, **fc, &out2)) {
+      if (FindEmulator::Get()->HandleFind(cmd, **fc, loc, &out2)) {
         need_check = true;
       }
 #else
-      if (FindEmulator::Get()->HandleFind(cmd, **fc, s)) {
+      if (FindEmulator::Get()->HandleFind(cmd, **fc, loc, s)) {
         return;
       }
 #endif
@@ -517,7 +520,7 @@ static void ShellFuncImpl(const string& shell, const string& cmd,
   }
 
   COLLECT_STATS_WITH_SLOW_REPORT("func shell time", cmd.c_str());
-  RunCommand(shell, cmd, RedirectStderr::NONE, s);
+  RunCommand(shell, shellflag, cmd, RedirectStderr::NONE, s);
   FormatForCommandSubstitution(s);
 
 #ifdef TEST_FIND_EMULATOR
@@ -533,7 +536,9 @@ static void ShellFuncImpl(const string& shell, const string& cmd,
 static vector<CommandResult*> g_command_results;
 
 bool ShouldStoreCommandResult(StringPiece cmd) {
-  if (HasWord(cmd, "date") || HasWord(cmd, "echo"))
+  // We really just want to ignore this one, or remove BUILD_DATETIME from
+  // Android completely
+  if (cmd == "date +%s")
     return false;
 
   Pattern pat(g_flags.ignore_dirty_pattern);
@@ -551,9 +556,9 @@ void ShellFunc(const vector<Value*>& args, Evaluator* ev, string* s) {
   string cmd = args[0]->Eval(ev);
   if (ev->avoid_io() && !HasNoIoInShellScript(cmd)) {
     if (ev->eval_depth() > 1) {
-      ERROR("%s:%d: kati doesn't support passing results of $(shell) "
-            "to other make constructs: %s",
-            LOCF(ev->loc()), cmd.c_str());
+      ERROR_LOC(ev->loc(), "kati doesn't support passing results of $(shell) "
+                "to other make constructs: %s",
+                cmd.c_str());
     }
     StripShellComment(&cmd);
     *s += "$(";
@@ -562,14 +567,17 @@ void ShellFunc(const vector<Value*>& args, Evaluator* ev, string* s) {
     return;
   }
 
-  const string&& shell = ev->GetShellAndFlag();
+  const string&& shell = ev->GetShell();
+  const string&& shellflag = ev->GetShellFlag();
 
   string out;
   FindCommand* fc = NULL;
-  ShellFuncImpl(shell, cmd, &out, &fc);
+  ShellFuncImpl(shell, shellflag, cmd, ev->loc(), &out, &fc);
   if (ShouldStoreCommandResult(cmd)) {
     CommandResult* cr = new CommandResult();
+    cr->op = (fc == NULL) ? CommandOp::SHELL : CommandOp::FIND,
     cr->shell = shell;
+    cr->shellflag = shellflag;
     cr->cmd = cmd;
     cr->find.reset(fc);
     cr->result = out;
@@ -588,8 +596,8 @@ void CallFunc(const vector<Value*>& args, Evaluator* ev, string* s) {
   const StringPiece func_name = TrimSpace(func_name_buf);
   Var* func = ev->LookupVar(Intern(func_name));
   if (!func->IsDefined()) {
-    KATI_WARN("%s:%d: *warning*: undefined user function: %s",
-              ev->loc(), func_name.as_string().c_str());
+    KATI_WARN_LOC(ev->loc(), "*warning*: undefined user function: %s",
+                  func_name.as_string().c_str());
   }
   vector<unique_ptr<SimpleVar>> av;
   for (size_t i = 1; i < args.size(); i++) {
@@ -669,8 +677,7 @@ void WarningFunc(const vector<Value*>& args, Evaluator* ev, string*) {
         StringPrintf("echo -e \"%s:%d: %s\" 2>&1", LOCF(ev->loc()), EchoEscape(a).c_str()));
     return;
   }
-  printf("%s:%d: %s\n", LOCF(ev->loc()), a.c_str());
-  fflush(stdout);
+  WARN_LOC(ev->loc(), "%s", a.c_str());
 }
 
 void ErrorFunc(const vector<Value*>& args, Evaluator* ev, string*) {
@@ -682,6 +689,124 @@ void ErrorFunc(const vector<Value*>& args, Evaluator* ev, string*) {
     return;
   }
   ev->Error(StringPrintf("*** %s.", a.c_str()));
+}
+
+static void FileReadFunc(Evaluator* ev, const string& filename, string* s) {
+  int fd = open(filename.c_str(), O_RDONLY);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      if (ShouldStoreCommandResult(filename)) {
+        CommandResult* cr = new CommandResult();
+        cr->op = CommandOp::READ_MISSING;
+        cr->cmd = filename;
+        g_command_results.push_back(cr);
+      }
+      return;
+    } else {
+      ev->Error("*** open failed.");
+    }
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0) {
+    ev->Error("*** fstat failed.");
+  }
+
+  size_t len = st.st_size;
+  string out;
+  out.resize(len);
+  ssize_t r = HANDLE_EINTR(read(fd, &out[0], len));
+  if (r != static_cast<ssize_t>(len)) {
+    ev->Error("*** read failed.");
+  }
+
+  if (close(fd) < 0) {
+    ev->Error("*** close failed.");
+  }
+
+  if (out.back() == '\n') {
+    out.pop_back();
+  }
+
+  if (ShouldStoreCommandResult(filename)) {
+    CommandResult* cr = new CommandResult();
+    cr->op = CommandOp::READ;
+    cr->cmd = filename;
+    g_command_results.push_back(cr);
+  }
+  *s += out;
+}
+
+static void FileWriteFunc(Evaluator* ev, const string& filename, bool append, string text) {
+  FILE* f = fopen(filename.c_str(), append ? "ab" : "wb");
+  if (f == NULL) {
+    ev->Error("*** fopen failed.");
+  }
+
+  if (fwrite(&text[0], text.size(), 1, f) != 1) {
+    ev->Error("*** fwrite failed.");
+  }
+
+  if (fclose(f) != 0) {
+    ev->Error("*** fclose failed.");
+  }
+
+  if (ShouldStoreCommandResult(filename)) {
+    CommandResult* cr = new CommandResult();
+    cr->op = CommandOp::WRITE;
+    cr->cmd = filename;
+    cr->result = text;
+    g_command_results.push_back(cr);
+  }
+}
+
+void FileFunc(const vector<Value*>& args, Evaluator* ev, string* s) {
+  if (ev->avoid_io()) {
+    ev->Error("*** $(file ...) is not supported in rules.");
+  }
+
+  string arg = args[0]->Eval(ev);
+  StringPiece filename = TrimSpace(arg);
+
+  if (filename.size() <= 1) {
+    ev->Error("*** Missing filename");
+  }
+
+  if (filename[0] == '<') {
+    filename = TrimLeftSpace(filename.substr(1));
+    if (!filename.size()) {
+      ev->Error("*** Missing filename");
+    }
+    if (args.size() > 1) {
+      ev->Error("*** invalid argument");
+    }
+
+    FileReadFunc(ev, filename.as_string(), s);
+  } else if (filename[0] == '>') {
+    bool append = false;
+    if (filename[1] == '>') {
+      append = true;
+      filename = filename.substr(2);
+    } else {
+      filename = filename.substr(1);
+    }
+    filename = TrimLeftSpace(filename);
+    if (!filename.size()) {
+      ev->Error("*** Missing filename");
+    }
+
+    string text;
+    if (args.size() > 1) {
+      text = args[1]->Eval(ev);
+      if (text.size() == 0 || text.back() != '\n') {
+        text.push_back('\n');
+      }
+    }
+
+    FileWriteFunc(ev, filename.as_string(), append, text);
+  } else {
+    ev->Error(StringPrintf("*** Invalid file operation: %s.  Stop.", filename.as_string().c_str()));
+  }
 }
 
 FuncInfo g_func_infos[] = {
@@ -725,6 +850,8 @@ FuncInfo g_func_infos[] = {
   { "info", &InfoFunc, 1, 1, false, false },
   { "warning", &WarningFunc, 1, 1, false, false },
   { "error", &ErrorFunc, 1, 1, false, false },
+
+  { "file", &FileFunc, 2, 1, false, false },
 };
 
 unordered_map<StringPiece, FuncInfo*>* g_func_info_map;
